@@ -1,6 +1,82 @@
 import subprocess
 import json
 
+# ------------------------------
+# Helper functions for resource parsing
+# ------------------------------
+def parse_cpu(cpu_value):
+    """Parse CPU value (handles 'm' suffix for millicores)"""
+    if not cpu_value:
+        return 0.0
+    cpu_str = str(cpu_value).strip().lower()
+    try:
+        if cpu_str.endswith('m'):
+            # Convert millicores to cores
+            return float(cpu_str[:-1]) / 1000.0
+        else:
+            # Assume value is in cores
+            return float(cpu_str)
+    except (ValueError, TypeError):
+        return 0.0
+
+def parse_memory(mem_value):
+    """Parse memory value (handles common Kubernetes units)"""
+    if not mem_value:
+        return 0
+    mem_str = str(mem_value).strip().lower()
+    memory_units = {
+        'k': 1000,
+        'm': 1000**2,
+        'g': 1000**3,
+        't': 1000**4,
+        'p': 1000**5,
+        'e': 1000**6,
+        'ki': 1024,
+        'mi': 1024**2,
+        'gi': 1024**3,
+        'ti': 1024**4,
+        'pi': 1024**5,
+        'ei': 1024**6,
+    }
+
+    # Extract unit and numeric part
+    unit = ''
+    if len(mem_str) >= 2 and mem_str[-2:] in memory_units:
+        unit = mem_str[-2:]
+        num_str = mem_str[:-2]
+    elif len(mem_str) >= 1 and mem_str[-1] in memory_units:
+        unit = mem_str[-1]
+        num_str = mem_str[:-1]
+    else:
+        num_str = mem_str
+
+    try:
+        num = float(num_str)
+        return num * memory_units.get(unit, 1)
+    except (ValueError, TypeError):
+        return 0
+
+def format_memory(bytes_value):
+    """Convert bytes to human-readable format"""
+    if bytes_value == 0:
+        return "0"
+    units = [
+        ('Ei', 1024**6),
+        ('Pi', 1024**5),
+        ('Ti', 1024**4),
+        ('Gi', 1024**3),
+        ('Mi', 1024**2),
+        ('Ki', 1024),
+        ('B', 1)
+    ]
+    for unit, factor in units:
+        if bytes_value >= factor:
+            return f"{bytes_value/factor:.2f} {unit}"
+    return f"{bytes_value} B"
+
+# ------------------------------
+# Data collection functions
+# ------------------------------
 def get_all_nodes():
     """Execute 'omc get node -o json' command and return parsed node data"""
     try:
@@ -57,6 +133,9 @@ def get_all_pods():
         print(f"Unexpected error in pod retrieval: {e}")
         return None
 
+# ------------------------------
+# Data processing functions
+# ------------------------------
 def create_node_ip_to_name_map(node_data):
     """Create a mapping from node IP (status.addresses[0].address) to node name"""
     node_ip_map = {}
@@ -66,9 +145,7 @@ def create_node_ip_to_name_map(node_data):
         
     for node in node_data['items']:
         try:
-            # Get node name
             node_name = node['metadata']['name']
-            # Get node IP from first address entry
             node_ip = node['status']['addresses'][0]['address']
             node_ip_map[node_ip] = node_name
         except KeyError as e:
@@ -81,29 +158,74 @@ def create_node_ip_to_name_map(node_data):
     return node_ip_map
 
 def group_pods_by_node(pod_data, node_ip_map):
-    """Group pods by their corresponding node using hostIP correlation"""
+    """Group pods by node with resource calculations"""
+    # Structure: {node_name: {'totals': {...}, 'pods': [...]}}
     grouped_pods = {}
-    ungrouped_pods = []  # For pods that couldn't be matched to a node
+    ungrouped_pods = []
     
     if not pod_data or 'items' not in pod_data or not isinstance(pod_data['items'], list):
         return grouped_pods, ungrouped_pods
         
     for pod in pod_data['items']:
         try:
-            # Get pod basic info
+            # Basic pod info
             pod_namespace = pod['metadata']['namespace']
             pod_name = pod['metadata']['name']
             pod_host_ip = pod['status']['hostIP']
             
-            # Find corresponding node name
+            # Initialize pod resource totals
+            pod_cpu_request = 0.0
+            pod_cpu_limit = 0.0
+            pod_mem_request = 0
+            pod_mem_limit = 0
+            
+            # Get containers and calculate resources
+            containers = pod.get('spec', {}).get('containers', [])
+            for container in containers:
+                resources = container.get('resources', {})
+                requests = resources.get('requests', {})
+                limits = resources.get('limits', {})
+                
+                # Accumulate container resources to pod totals
+                pod_cpu_request += parse_cpu(requests.get('cpu'))
+                pod_cpu_limit += parse_cpu(limits.get('cpu'))
+                pod_mem_request += parse_memory(requests.get('memory'))
+                pod_mem_limit += parse_memory(limits.get('memory'))
+            
+            # Prepare pod info with resources
+            pod_info = {
+                'namespace': pod_namespace,
+                'name': pod_name,
+                'cpu_request': pod_cpu_request,
+                'cpu_limit': pod_cpu_limit,
+                'mem_request': pod_mem_request,
+                'mem_limit': pod_mem_limit
+            }
+            
+            # Add to appropriate node group
             if pod_host_ip in node_ip_map:
                 node_name = node_ip_map[pod_host_ip]
-                # Add to grouped pods
+                
+                # Initialize node entry if not exists
                 if node_name not in grouped_pods:
-                    grouped_pods[node_name] = []
-                grouped_pods[node_name].append((pod_namespace, pod_name))
+                    grouped_pods[node_name] = {
+                        'totals': {
+                            'cpu_request': 0.0,
+                            'cpu_limit': 0.0,
+                            'mem_request': 0,
+                            'mem_limit': 0
+                        },
+                        'pods': []
+                    }
+                
+                # Add pod to node and update totals
+                grouped_pods[node_name]['pods'].append(pod_info)
+                grouped_pods[node_name]['totals']['cpu_request'] += pod_cpu_request
+                grouped_pods[node_name]['totals']['cpu_limit'] += pod_cpu_limit
+                grouped_pods[node_name]['totals']['mem_request'] += pod_mem_request
+                grouped_pods[node_name]['totals']['mem_limit'] += pod_mem_limit
             else:
-                ungrouped_pods.append((pod_host_ip, pod_namespace, pod_name))
+                ungrouped_pods.append(pod_info)
                 
         except KeyError as e:
             print(f"Warning: Missing {e} field in pod {pod.get('metadata', {}).get('name', 'unknown')}, skipping")
@@ -112,28 +234,40 @@ def group_pods_by_node(pod_data, node_ip_map):
     
     return grouped_pods, ungrouped_pods
 
-def print_pods_grouped_by_node(grouped_pods, ungrouped_pods):
-    """Print pods grouped by their node, followed by ungrouped pods"""
-    print("\n=== Pods Grouped by Node ===")
+def print_pods_with_resources(grouped_pods, ungrouped_pods):
+    """Print pods grouped by node with resource information"""
+    print("\n=== Pods Grouped by Node with Resource Summary ===")
     
     # Print grouped pods
     if grouped_pods:
-        for node_name, pods in grouped_pods.items():
+        for node_name, data in grouped_pods.items():
             print(f"\nNode: {node_name}")
+            print("  Resource Totals:")
+            print(f"    CPU Requests: {data['totals']['cpu_request']:.3f} cores")
+            print(f"    CPU Limits: {data['totals']['cpu_limit']:.3f} cores")
+            print(f"    Memory Requests: {format_memory(data['totals']['mem_request'])}")
+            print(f"    Memory Limits: {format_memory(data['totals']['mem_limit'])}")
             print("  Pods:")
-            for namespace, pod_name in pods:
-                print(f"  - {namespace}/{pod_name}")
+            for pod in data['pods']:
+                print(f"    - {pod['namespace']}/{pod['name']}")
+                print(f"        CPU Request: {pod['cpu_request']:.3f} cores | Limit: {pod['cpu_limit']:.3f} cores")
+                print(f"        Memory Request: {format_memory(pod['mem_request'])} | Limit: {format_memory(pod['mem_limit'])}")
     else:
         print("\nNo pods were successfully grouped by node")
     
     # Print ungrouped pods if any
     if ungrouped_pods:
         print("\n=== Ungrouped Pods (could not match to a node) ===")
-        for host_ip, namespace, pod_name in ungrouped_pods:
-            print(f"Host IP: {host_ip} - {namespace}/{pod_name}")
+        for pod in ungrouped_pods:
+            print(f"  - {pod['namespace']}/{pod['name']}")
+            print(f"      CPU Request: {pod['cpu_request']:.3f} cores | Limit: {pod['cpu_limit']:.3f} cores")
+            print(f"      Memory Request: {format_memory(pod['mem_request'])} | Limit: {format_memory(pod['mem_limit'])}")
 
+# ------------------------------
+# Main execution
+# ------------------------------
 if __name__ == "__main__":
-    # First, get node data
+    # Get node data and create IP mapping
     print("Retrieving node information...")
     node_data = get_all_nodes()
     
@@ -141,20 +275,17 @@ if __name__ == "__main__":
         print("Failed to retrieve valid node data - cannot proceed with pod grouping")
     else:
         print("Successfully retrieved node data")
-        # Create mapping from node IP to node name
         node_ip_map = create_node_ip_to_name_map(node_data)
         print(f"Created node IP mapping for {len(node_ip_map)} nodes")
 
-        # Then, get pod data
+        # Get pod data and group by node with resources
         print("\nRetrieving pod information...")
         pod_data = get_all_pods()
         
         if pod_data:
             print("Successfully retrieved pod data")
-            # Group pods by node
             grouped_pods, ungrouped_pods = group_pods_by_node(pod_data, node_ip_map)
-            # Print the results
-            print_pods_grouped_by_node(grouped_pods, ungrouped_pods)
+            print_pods_with_resources(grouped_pods, ungrouped_pods)
         else:
             print("Failed to retrieve valid pod data")
     
