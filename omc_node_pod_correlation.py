@@ -143,8 +143,8 @@ def get_all_pods():
 # Data processing functions
 # ------------------------------
 def create_node_info_map(node_data):
-    """Create a mapping from node IP to node info (name + allocatable resources)"""
-    node_info_map = {}  # {ip: {name, allocatable_cpu, allocatable_memory}}
+    """Create a mapping from node IP to node info (name + allocatable resources + node type)"""
+    node_info_map = {}  # {ip: {name, allocatable_cpu, allocatable_memory, node_type}}
     
     if not node_data or 'items' not in node_data or not isinstance(node_data['items'], list):
         return node_info_map
@@ -154,6 +154,15 @@ def create_node_info_map(node_data):
             node_name = node['metadata']['name']
             node_ip = node['status']['addresses'][0]['address']
             
+            # Extract node type from labels (node-role.kubernetes.io/<nodetype>)
+            node_type = "unknown"
+            labels = node.get('metadata', {}).get('labels', {})
+            for label_key in labels:
+                if label_key.startswith('node-role.kubernetes.io/'):
+                    # Extract the part after the last slash as node type
+                    node_type = label_key.split('/')[-1]
+                    break  # Take the first matching role label
+            
             # Get and parse allocatable resources
             allocatable = node.get('status', {}).get('allocatable', {})
             allocatable_cpu = parse_cpu(allocatable.get('cpu', '0'))
@@ -161,6 +170,7 @@ def create_node_info_map(node_data):
             
             node_info_map[node_ip] = {
                 'name': node_name,
+                'node_type': node_type,
                 'allocatable_cpu': allocatable_cpu,
                 'allocatable_memory': allocatable_memory
             }
@@ -175,7 +185,7 @@ def create_node_info_map(node_data):
 
 def group_pods_by_node(pod_data, node_info_map):
     """Group pods by node with resource calculations and allocatable info"""
-    # Structure: {node_name: {'allocatable': {...}, 'totals': {...}, 'pods': [...]}}
+    # Structure: {node_name: {'allocatable': {...}, 'node_type': ..., 'totals': {...}, 'pods': [...]}}
     grouped_pods = {}
     ungrouped_pods = []
     
@@ -226,6 +236,7 @@ def group_pods_by_node(pod_data, node_info_map):
                 # Initialize node entry if not exists
                 if node_name not in grouped_pods:
                     grouped_pods[node_name] = {
+                        'node_type': node_info['node_type'],
                         'allocatable': {
                             'cpu': node_info['allocatable_cpu'],
                             'memory': node_info['allocatable_memory']
@@ -256,13 +267,13 @@ def group_pods_by_node(pod_data, node_info_map):
     return grouped_pods, ungrouped_pods
 
 def print_pods_with_resources(grouped_pods, ungrouped_pods):
-    """Print pods grouped by node with resource summary, allocatable resources, and percentages"""
+    """Print pods grouped by node with resource summary, allocatable resources, percentages, and node type"""
     print("\n=== Pods Grouped by Node with Resource Utilization ===")
     
     # Print grouped pods
     if grouped_pods:
         for node_name, data in grouped_pods.items():
-            print(f"\nNode: {node_name}")
+            print(f"\nNode: {node_name} (Type: {data['node_type']})")  # Display node type here
             
             # Allocatable resources
             print("  Allocatable Resources:")
@@ -316,7 +327,7 @@ def print_pods_with_resources(grouped_pods, ungrouped_pods):
 # Main execution
 # ------------------------------
 if __name__ == "__main__":
-    # Get node data and create info map (includes allocatable resources)
+    # Get node data and create info map (includes allocatable resources and node type)
     print("Retrieving node information...")
     node_data = get_all_nodes()
     
