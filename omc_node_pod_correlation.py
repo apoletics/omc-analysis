@@ -76,6 +76,153 @@ def calculate_percentage(used, total):
     return f"{(used / total) * 100:.2f}%"
 
 # ------------------------------
+# Resource configuration check functions
+# ------------------------------
+def has_missing_resources(pod):
+    """Check if a pod is missing any resource requests or limits"""
+    return (pod['cpu_request'] == 0 or 
+            pod['cpu_limit'] == 0 or 
+            pod['mem_request'] == 0 or 
+            pod['mem_limit'] == 0)
+
+def calculate_pod_resource_coverage(grouped_pods, ungrouped_pods):
+    """Calculate pod counts by node type, including those missing resources"""
+    # Structure: {node_type: {'total': int, 'without_resources': int}}
+    by_node_type = defaultdict(lambda: {'total': 0, 'without_resources': 0})
+    total_pods = 0
+    pods_without_complete_config = 0
+
+    # Check grouped pods (by node type)
+    for node_data in grouped_pods.values():
+        node_type = node_data['node_type']
+        for pod in node_data['pods']:
+            # Update global counts
+            total_pods += 1
+            # Update per-type counts
+            by_node_type[node_type]['total'] += 1
+            
+            if has_missing_resources(pod):
+                pods_without_complete_config += 1
+                by_node_type[node_type]['without_resources'] += 1
+
+    # Check ungrouped pods (special category)
+    ungrouped_total = 0
+    ungrouped_missing = 0
+    for pod in ungrouped_pods:
+        total_pods += 1
+        ungrouped_total += 1
+        
+        if has_missing_resources(pod):
+            pods_without_complete_config += 1
+            ungrouped_missing += 1
+    
+    # Add ungrouped as a special "type"
+    by_node_type['ungrouped'] = {
+        'total': ungrouped_total,
+        'without_resources': ungrouped_missing
+    }
+
+    return total_pods, pods_without_complete_config, by_node_type
+
+def print_pod_resource_coverage(total_pods, pods_without, by_node_type):
+    """Print summary of pod resource configuration with node type breakdown"""
+    print("\n=== Pod Resource Configuration Analysis ===")
+    if total_pods == 0:
+        print("No pods found for resource configuration analysis")
+        return
+
+    # Overall summary
+    overall_percentage = (pods_without / total_pods) * 100
+    print(f"Overall Summary:")
+    print(f"  Total pods analyzed: {total_pods}")
+    print(f"  Pods missing at least one resource request or limit: {pods_without} ({overall_percentage:.2f}%)")
+    print("\nBreakdown by Node Type:")
+    print("-" * 40)
+    print(f"{'Node Type':<15} {'Total Pods':<12} {'Missing Resources':<18} {'Percentage':<10}")
+    print("-" * 40)
+
+    # Print each node type's statistics
+    for node_type in sorted(by_node_type.keys()):
+        stats = by_node_type[node_type]
+        if stats['total'] == 0:
+            continue
+            
+        pct = (stats['without_resources'] / stats['total']) * 100
+        print(f"{node_type:<15} {stats['total']:<12} {stats['without_resources']:<18} {pct:.2f}%")
+
+    print("-" * 40)
+    print("Note: A pod is considered incomplete if it lacks CPU requests, CPU limits, memory requests, or memory limits")
+
+# ------------------------------
+# Prometheus Alert functions
+# ------------------------------
+def get_prometheus_alerts():
+    """Execute 'omc prom rules -s firing,pending -o json' and return parsed alert data"""
+    try:
+        result = subprocess.run(
+            ["omc", "prom", "rules", "-s", "firing,pending", "-o", "json"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        if not result.stdout:
+            print("Alert command executed successfully but returned no data")
+            return None
+        
+        return json.loads(result.stdout)
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Alert command failed with return code: {e.returncode}")
+        print(f"Error output: {e.stderr}")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"Alert JSON parsing failed: {e}")
+        print(f"Raw alert output: {result.stdout}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error in alert retrieval: {e}")
+        return None
+
+def count_alerts_by_severity(alert_data):
+    """Count alerts by severity (critical, warning, and other)"""
+    counts = {
+        'critical': 0,
+        'warning': 0,
+        'other': 0,
+        'total': 0
+    }
+    
+    if not alert_data or 'data' not in alert_data or not isinstance(alert_data['data'], list):
+        return counts
+    
+    for alert in alert_data['data']:
+        counts['total'] += 1
+        # Get severity label if present
+        severity = alert.get('labels', {}).get('severity', '').lower()
+        
+        if severity == 'critical':
+            counts['critical'] += 1
+        elif severity == 'warning':
+            counts['warning'] += 1
+        else:
+            counts['other'] += 1
+    
+    return counts
+
+def print_alert_summary(counts):
+    """Print summary of Prometheus alerts by severity"""
+    print("\n=== Prometheus Alert Summary ===")
+    if counts['total'] == 0:
+        print("No firing or pending alerts found")
+        return
+    
+    print(f"Total firing/pending alerts: {counts['total']}")
+    print(f"  Critical: {counts['critical']} ({(counts['critical']/counts['total'])*100:.2f}%)")
+    print(f"  Warning: {counts['warning']} ({(counts['warning']/counts['total'])*100:.2f}%)")
+    print(f"  Other/Unknown severity: {counts['other']} ({(counts['other']/counts['total'])*100:.2f}%)")
+
+# ------------------------------
 # Data collection functions
 # ------------------------------
 def get_all_nodes():
@@ -161,7 +308,7 @@ def create_node_info_map(node_data):
             allocatable = node.get('status', {}).get('allocatable', {})
             allocatable_cpu = parse_cpu(allocatable.get('cpu', '0'))
             allocatable_memory = parse_memory(allocatable.get('memory', '0'))
-            allocatable_pods = parse_pods(allocatable.get('pods', '0'))  # New: parse pod count
+            allocatable_pods = parse_pods(allocatable.get('pods', '0'))  # Parse pod count
             
             node_info_map[node_ip] = {
                 'name': node_name,
@@ -169,7 +316,7 @@ def create_node_info_map(node_data):
                 'labels': labels,
                 'allocatable_cpu': allocatable_cpu,
                 'allocatable_memory': allocatable_memory,
-                'allocatable_pods': allocatable_pods  # New: store pod allocations
+                'allocatable_pods': allocatable_pods
             }
         except KeyError as e:
             print(f"Warning: Missing {e} field in node {node.get('metadata', {}).get('name', 'unknown')}, skipping")
@@ -237,7 +384,7 @@ def group_pods_by_node(pod_data, node_info_map):
                         'allocatable': {
                             'cpu': node_info['allocatable_cpu'],
                             'memory': node_info['allocatable_memory'],
-                            'pods': node_info['allocatable_pods']  # New: add pod allocations
+                            'pods': node_info['allocatable_pods']
                         },
                         'totals': {
                             'cpu_request': 0.0,
@@ -245,13 +392,13 @@ def group_pods_by_node(pod_data, node_info_map):
                             'mem_request': 0,
                             'mem_limit': 0
                         },
-                        'pod_count': 0,  # New: track pod count
+                        'pod_count': 0,
                         'pods': []
                     }
                 
                 # Add pod to node and update totals
                 grouped_pods[node_name]['pods'].append(pod_info)
-                grouped_pods[node_name]['pod_count'] += 1  # New: increment pod count
+                grouped_pods[node_name]['pod_count'] += 1
                 grouped_pods[node_name]['totals']['cpu_request'] += pod_cpu_request
                 grouped_pods[node_name]['totals']['cpu_limit'] += pod_cpu_limit
                 grouped_pods[node_name]['totals']['mem_request'] += pod_mem_request
@@ -312,12 +459,12 @@ def aggregate_nodes_by_type_and_labels(node_data, grouped_pods, node_info_map):
             total_nodes = len(node_names)
             total_allocatable_cpu = 0.0
             total_allocatable_memory = 0
-            total_allocatable_pods = 0  # New: track total pod capacity
+            total_allocatable_pods = 0
             total_cpu_request = 0.0
             total_cpu_limit = 0.0
             total_mem_request = 0
             total_mem_limit = 0
-            total_pod_count = 0  # New: track total pods in group
+            total_pod_count = 0
             
             # Sum resources across all nodes in the group
             for node_name in node_names:
@@ -326,13 +473,13 @@ def aggregate_nodes_by_type_and_labels(node_data, grouped_pods, node_info_map):
                     # Allocatable resources
                     total_allocatable_cpu += node_data['allocatable']['cpu']
                     total_allocatable_memory += node_data['allocatable']['memory']
-                    total_allocatable_pods += node_data['allocatable']['pods']  # New
+                    total_allocatable_pods += node_data['allocatable']['pods']
                     # Pod resources
                     total_cpu_request += node_data['totals']['cpu_request']
                     total_cpu_limit += node_data['totals']['cpu_limit']
                     total_mem_request += node_data['totals']['mem_request']
                     total_mem_limit += node_data['totals']['mem_limit']
-                    total_pod_count += node_data['pod_count']  # New
+                    total_pod_count += node_data['pod_count']
             
             aggregated_results[node_type][label_key] = {
                 'common_labels': common_labels,
@@ -341,14 +488,14 @@ def aggregate_nodes_by_type_and_labels(node_data, grouped_pods, node_info_map):
                 'allocatable': {
                     'cpu': total_allocatable_cpu,
                     'memory': total_allocatable_memory,
-                    'pods': total_allocatable_pods  # New
+                    'pods': total_allocatable_pods
                 },
                 'totals': {
                     'cpu_request': total_cpu_request,
                     'cpu_limit': total_cpu_limit,
                     'mem_request': total_mem_request,
                     'mem_limit': total_mem_limit,
-                    'pod_count': total_pod_count  # New
+                    'pod_count': total_pod_count
                 }
             }
     
@@ -379,7 +526,7 @@ def print_aggregated_nodes(aggregated_results):
             print("    Aggregated Allocatable Resources:")
             print(f"      Total CPU: {group_data['allocatable']['cpu']:.3f} cores")
             print(f"      Total Memory: {format_memory(group_data['allocatable']['memory'])}")
-            print(f"      Total Pod Capacity: {group_data['allocatable']['pods']} pods")  # New
+            print(f"      Total Pod Capacity: {group_data['allocatable']['pods']} pods")
             
             print("    Aggregated Usage:")
             # CPU calculations
@@ -406,7 +553,7 @@ def print_aggregated_nodes(aggregated_results):
             print(f"      Memory Requests: {format_memory(group_data['totals']['mem_request'])} ({mem_request_pct} of allocatable)")
             print(f"      Memory Limits: {format_memory(group_data['totals']['mem_limit'])} ({mem_limit_pct} of allocatable)")
             
-            # New: Pod count calculations
+            # Pod count calculations
             pod_pct = calculate_percentage(
                 group_data['totals']['pod_count'],
                 group_data['allocatable']['pods']
@@ -426,7 +573,7 @@ def print_pods_with_resources(grouped_pods, ungrouped_pods, show_pods=False):
             print("  Allocatable Resources:")
             print(f"    CPU: {data['allocatable']['cpu']:.3f} cores")
             print(f"    Memory: {format_memory(data['allocatable']['memory'])}")
-            print(f"    Max Pods: {data['allocatable']['pods']}")  # New
+            print(f"    Max Pods: {data['allocatable']['pods']}")
             
             # Total requests/limits with percentages
             print("  Total Usage:")
@@ -454,7 +601,7 @@ def print_pods_with_resources(grouped_pods, ungrouped_pods, show_pods=False):
             print(f"    Memory Requests: {format_memory(data['totals']['mem_request'])} ({mem_request_pct} of allocatable)")
             print(f"    Memory Limits: {format_memory(data['totals']['mem_limit'])} ({mem_limit_pct} of allocatable)")
             
-            # New: Pod count calculation
+            # Pod count calculation
             pod_pct = calculate_percentage(
                 data['pod_count'], 
                 data['allocatable']['pods']
@@ -505,9 +652,22 @@ if __name__ == "__main__":
             grouped_pods, ungrouped_pods = group_pods_by_node(pod_data, node_info_map)
             print_pods_with_resources(grouped_pods, ungrouped_pods, args.show_pods)
             
+            # Add pod resource configuration analysis with node type breakdown
+            total_pods, pods_without, by_node_type = calculate_pod_resource_coverage(grouped_pods, ungrouped_pods)
+            print_pod_resource_coverage(total_pods, pods_without, by_node_type)
+            
             # Add aggregated nodes section (all types)
             aggregated_results = aggregate_nodes_by_type_and_labels(node_data, grouped_pods, node_info_map)
             print_aggregated_nodes(aggregated_results)
+            
+            # Add Prometheus alert analysis
+            print("\nRetrieving Prometheus alert information...")
+            alert_data = get_prometheus_alerts()
+            if alert_data:
+                alert_counts = count_alerts_by_severity(alert_data)
+                print_alert_summary(alert_counts)
+            else:
+                print("Failed to retrieve or process Prometheus alert data")
         else:
             print("Failed to retrieve valid pod data")
     
