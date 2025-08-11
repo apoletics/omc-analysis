@@ -74,6 +74,12 @@ def format_memory(bytes_value):
             return f"{bytes_value/factor:.2f} {unit}"
     return f"{bytes_value} B"
 
+def calculate_percentage(used, total):
+    """Calculate percentage with error handling for division by zero"""
+    if total <= 0:
+        return "N/A"
+    return f"{(used / total) * 100:.2f}%"
+
 # ------------------------------
 # Data collection functions
 # ------------------------------
@@ -136,18 +142,28 @@ def get_all_pods():
 # ------------------------------
 # Data processing functions
 # ------------------------------
-def create_node_ip_to_name_map(node_data):
-    """Create a mapping from node IP (status.addresses[0].address) to node name"""
-    node_ip_map = {}
+def create_node_info_map(node_data):
+    """Create a mapping from node IP to node info (name + allocatable resources)"""
+    node_info_map = {}  # {ip: {name, allocatable_cpu, allocatable_memory}}
     
     if not node_data or 'items' not in node_data or not isinstance(node_data['items'], list):
-        return node_ip_map
+        return node_info_map
         
     for node in node_data['items']:
         try:
             node_name = node['metadata']['name']
             node_ip = node['status']['addresses'][0]['address']
-            node_ip_map[node_ip] = node_name
+            
+            # Get and parse allocatable resources
+            allocatable = node.get('status', {}).get('allocatable', {})
+            allocatable_cpu = parse_cpu(allocatable.get('cpu', '0'))
+            allocatable_memory = parse_memory(allocatable.get('memory', '0'))
+            
+            node_info_map[node_ip] = {
+                'name': node_name,
+                'allocatable_cpu': allocatable_cpu,
+                'allocatable_memory': allocatable_memory
+            }
         except KeyError as e:
             print(f"Warning: Missing {e} field in node {node.get('metadata', {}).get('name', 'unknown')}, skipping")
         except IndexError:
@@ -155,11 +171,11 @@ def create_node_ip_to_name_map(node_data):
         except Exception as e:
             print(f"Error processing node {node.get('metadata', {}).get('name', 'unknown')}: {e}")
     
-    return node_ip_map
+    return node_info_map
 
-def group_pods_by_node(pod_data, node_ip_map):
-    """Group pods by node with resource calculations"""
-    # Structure: {node_name: {'totals': {...}, 'pods': [...]}}
+def group_pods_by_node(pod_data, node_info_map):
+    """Group pods by node with resource calculations and allocatable info"""
+    # Structure: {node_name: {'allocatable': {...}, 'totals': {...}, 'pods': [...]}}
     grouped_pods = {}
     ungrouped_pods = []
     
@@ -203,12 +219,17 @@ def group_pods_by_node(pod_data, node_ip_map):
             }
             
             # Add to appropriate node group
-            if pod_host_ip in node_ip_map:
-                node_name = node_ip_map[pod_host_ip]
+            if pod_host_ip in node_info_map:
+                node_info = node_info_map[pod_host_ip]
+                node_name = node_info['name']
                 
                 # Initialize node entry if not exists
                 if node_name not in grouped_pods:
                     grouped_pods[node_name] = {
+                        'allocatable': {
+                            'cpu': node_info['allocatable_cpu'],
+                            'memory': node_info['allocatable_memory']
+                        },
                         'totals': {
                             'cpu_request': 0.0,
                             'cpu_limit': 0.0,
@@ -235,18 +256,46 @@ def group_pods_by_node(pod_data, node_ip_map):
     return grouped_pods, ungrouped_pods
 
 def print_pods_with_resources(grouped_pods, ungrouped_pods):
-    """Print pods grouped by node with resource information"""
-    print("\n=== Pods Grouped by Node with Resource Summary ===")
+    """Print pods grouped by node with resource summary, allocatable resources, and percentages"""
+    print("\n=== Pods Grouped by Node with Resource Utilization ===")
     
     # Print grouped pods
     if grouped_pods:
         for node_name, data in grouped_pods.items():
             print(f"\nNode: {node_name}")
-            print("  Resource Totals:")
-            print(f"    CPU Requests: {data['totals']['cpu_request']:.3f} cores")
-            print(f"    CPU Limits: {data['totals']['cpu_limit']:.3f} cores")
-            print(f"    Memory Requests: {format_memory(data['totals']['mem_request'])}")
-            print(f"    Memory Limits: {format_memory(data['totals']['mem_limit'])}")
+            
+            # Allocatable resources
+            print("  Allocatable Resources:")
+            print(f"    CPU: {data['allocatable']['cpu']:.3f} cores")
+            print(f"    Memory: {format_memory(data['allocatable']['memory'])}")
+            
+            # Total requests/limits with percentages
+            print("  Total Pod Resources:")
+            # CPU calculations
+            cpu_request_pct = calculate_percentage(
+                data['totals']['cpu_request'], 
+                data['allocatable']['cpu']
+            )
+            cpu_limit_pct = calculate_percentage(
+                data['totals']['cpu_limit'], 
+                data['allocatable']['cpu']
+            )
+            print(f"    CPU Requests: {data['totals']['cpu_request']:.3f} cores ({cpu_request_pct} of allocatable)")
+            print(f"    CPU Limits: {data['totals']['cpu_limit']:.3f} cores ({cpu_limit_pct} of allocatable)")
+            
+            # Memory calculations
+            mem_request_pct = calculate_percentage(
+                data['totals']['mem_request'], 
+                data['allocatable']['memory']
+            )
+            mem_limit_pct = calculate_percentage(
+                data['totals']['mem_limit'], 
+                data['allocatable']['memory']
+            )
+            print(f"    Memory Requests: {format_memory(data['totals']['mem_request'])} ({mem_request_pct} of allocatable)")
+            print(f"    Memory Limits: {format_memory(data['totals']['mem_limit'])} ({mem_limit_pct} of allocatable)")
+            
+            # Individual pods
             print("  Pods:")
             for pod in data['pods']:
                 print(f"    - {pod['namespace']}/{pod['name']}")
@@ -267,7 +316,7 @@ def print_pods_with_resources(grouped_pods, ungrouped_pods):
 # Main execution
 # ------------------------------
 if __name__ == "__main__":
-    # Get node data and create IP mapping
+    # Get node data and create info map (includes allocatable resources)
     print("Retrieving node information...")
     node_data = get_all_nodes()
     
@@ -275,8 +324,8 @@ if __name__ == "__main__":
         print("Failed to retrieve valid node data - cannot proceed with pod grouping")
     else:
         print("Successfully retrieved node data")
-        node_ip_map = create_node_ip_to_name_map(node_data)
-        print(f"Created node IP mapping for {len(node_ip_map)} nodes")
+        node_info_map = create_node_info_map(node_data)
+        print(f"Created node info mapping for {len(node_info_map)} nodes")
 
         # Get pod data and group by node with resources
         print("\nRetrieving pod information...")
@@ -284,7 +333,7 @@ if __name__ == "__main__":
         
         if pod_data:
             print("Successfully retrieved pod data")
-            grouped_pods, ungrouped_pods = group_pods_by_node(pod_data, node_ip_map)
+            grouped_pods, ungrouped_pods = group_pods_by_node(pod_data, node_info_map)
             print_pods_with_resources(grouped_pods, ungrouped_pods)
         else:
             print("Failed to retrieve valid pod data")
