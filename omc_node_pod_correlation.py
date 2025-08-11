@@ -1,5 +1,6 @@
 import subprocess
 import json
+from collections import defaultdict
 
 # ------------------------------
 # Helper functions for resource parsing
@@ -143,8 +144,8 @@ def get_all_pods():
 # Data processing functions
 # ------------------------------
 def create_node_info_map(node_data):
-    """Create a mapping from node IP to node info (name + allocatable resources + node type)"""
-    node_info_map = {}  # {ip: {name, allocatable_cpu, allocatable_memory, node_type}}
+    """Create a mapping from node IP to node info (name + allocatable resources + node type + labels)"""
+    node_info_map = {}  # {ip: {name, allocatable_cpu, allocatable_memory, node_type, labels}}
     
     if not node_data or 'items' not in node_data or not isinstance(node_data['items'], list):
         return node_info_map
@@ -153,13 +154,12 @@ def create_node_info_map(node_data):
         try:
             node_name = node['metadata']['name']
             node_ip = node['status']['addresses'][0]['address']
+            labels = node.get('metadata', {}).get('labels', {})
             
             # Extract node type from labels (node-role.kubernetes.io/<nodetype>)
             node_type = "unknown"
-            labels = node.get('metadata', {}).get('labels', {})
             for label_key in labels:
                 if label_key.startswith('node-role.kubernetes.io/'):
-                    # Extract the part after the last slash as node type
                     node_type = label_key.split('/')[-1]
                     break  # Take the first matching role label
             
@@ -171,6 +171,7 @@ def create_node_info_map(node_data):
             node_info_map[node_ip] = {
                 'name': node_name,
                 'node_type': node_type,
+                'labels': labels,
                 'allocatable_cpu': allocatable_cpu,
                 'allocatable_memory': allocatable_memory
             }
@@ -266,6 +267,136 @@ def group_pods_by_node(pod_data, node_info_map):
     
     return grouped_pods, ungrouped_pods
 
+def aggregate_worker_nodes_by_labels(node_data, grouped_pods, node_info_map):
+    """Aggregate worker nodes by common labels (excluding specified labels)"""
+    # Group worker nodes by their common labels (excluding specified labels)
+    label_groups = defaultdict(list)
+    
+    if not node_data or 'items' not in node_data or not isinstance(node_data['items'], list):
+        return label_groups
+    
+    for node in node_data['items']:
+        try:
+            node_name = node['metadata']['name']
+            # Get node info to check type
+            node_ip = node['status']['addresses'][0]['address']
+            if node_ip not in node_info_map:
+                continue
+                
+            node_info = node_info_map[node_ip]
+            # Only process worker nodes
+            if node_info['node_type'] != 'worker':
+                continue
+                
+            # Get labels and remove excluded labels
+            labels = node.get('metadata', {}).get('labels', {}).copy()
+            # Exclude specified labels
+            labels.pop('kubernetes.io/hostname', None)  # Unique hostname label
+            labels.pop('node.name', None)               # Additional excluded label
+            labels.pop('twistlock-defender', None)      # Additional excluded label
+            
+            # Create a hashable key from labels (sorted tuples)
+            label_key = tuple(sorted(labels.items()))
+            label_groups[label_key].append(node_name)
+            
+        except (KeyError, IndexError) as e:
+            print(f"Warning: Skipping node {node.get('metadata', {}).get('name', 'unknown')} during aggregation: {e}")
+        except Exception as e:
+            print(f"Error aggregating node {node.get('metadata', {}).get('name', 'unknown')}: {e}")
+    
+    # Calculate aggregated resources for each group
+    aggregated_groups = {}
+    for label_key, node_names in label_groups.items():
+        # Convert label key back to dictionary
+        common_labels = dict(label_key)
+        
+        # Initialize aggregates
+        total_nodes = len(node_names)
+        total_allocatable_cpu = 0.0
+        total_allocatable_memory = 0
+        total_cpu_request = 0.0
+        total_cpu_limit = 0.0
+        total_mem_request = 0
+        total_mem_limit = 0
+        
+        # Sum resources across all nodes in the group
+        for node_name in node_names:
+            if node_name in grouped_pods:
+                node_data = grouped_pods[node_name]
+                # Allocatable resources
+                total_allocatable_cpu += node_data['allocatable']['cpu']
+                total_allocatable_memory += node_data['allocatable']['memory']
+                # Pod resources
+                total_cpu_request += node_data['totals']['cpu_request']
+                total_cpu_limit += node_data['totals']['cpu_limit']
+                total_mem_request += node_data['totals']['mem_request']
+                total_mem_limit += node_data['totals']['mem_limit']
+        
+        aggregated_groups[label_key] = {
+            'common_labels': common_labels,
+            'node_count': total_nodes,
+            'nodes': node_names,
+            'allocatable': {
+                'cpu': total_allocatable_cpu,
+                'memory': total_allocatable_memory
+            },
+            'totals': {
+                'cpu_request': total_cpu_request,
+                'cpu_limit': total_cpu_limit,
+                'mem_request': total_mem_request,
+                'mem_limit': total_mem_limit
+            }
+        }
+    
+    return aggregated_groups
+
+def print_aggregated_worker_nodes(aggregated_groups):
+    """Print aggregated worker node information grouped by common labels"""
+    print("\n=== Aggregated Worker Nodes by Common Labels ===")
+    
+    if not aggregated_groups:
+        print("No worker nodes found for aggregation")
+        return
+    
+    for i, (_, group_data) in enumerate(aggregated_groups.items(), 1):
+        print(f"\nGroup {i}:")
+        print(f"  Number of worker nodes: {group_data['node_count']}")
+        print("  Common labels:")
+        for label, value in group_data['common_labels'].items():
+            print(f"    {label}: {value}")
+        print("  Nodes in group:")
+        for node_name in group_data['nodes']:
+            print(f"    - {node_name}")
+        
+        print("  Aggregated Allocatable Resources:")
+        print(f"    Total CPU: {group_data['allocatable']['cpu']:.3f} cores")
+        print(f"    Total Memory: {format_memory(group_data['allocatable']['memory'])}")
+        
+        print("  Aggregated Pod Resources:")
+        # CPU calculations
+        cpu_request_pct = calculate_percentage(
+            group_data['totals']['cpu_request'],
+            group_data['allocatable']['cpu']
+        )
+        cpu_limit_pct = calculate_percentage(
+            group_data['totals']['cpu_limit'],
+            group_data['allocatable']['cpu']
+        )
+        print(f"    Total CPU Requests: {group_data['totals']['cpu_request']:.3f} cores ({cpu_request_pct} of total allocatable)")
+        print(f"    Total CPU Limits: {group_data['totals']['cpu_limit']:.3f} cores ({cpu_limit_pct} of total allocatable)")
+        
+        # Memory calculations
+        mem_request_pct = calculate_percentage(
+            group_data['totals']['mem_request'],
+            group_data['allocatable']['memory']
+        )
+        mem_limit_pct = calculate_percentage(
+            group_data['totals']['mem_limit'],
+            group_data['allocatable']['memory']
+        )
+        print(f"    Total Memory Requests: {format_memory(group_data['totals']['mem_request'])} ({mem_request_pct} of total allocatable)")
+        print(f"    Total Memory Limits: {format_memory(group_data['totals']['mem_limit'])} ({mem_limit_pct} of total allocatable)")
+
 def print_pods_with_resources(grouped_pods, ungrouped_pods):
     """Print pods grouped by node with resource summary, allocatable resources, percentages, and node type"""
     print("\n=== Pods Grouped by Node with Resource Utilization ===")
@@ -273,7 +404,7 @@ def print_pods_with_resources(grouped_pods, ungrouped_pods):
     # Print grouped pods
     if grouped_pods:
         for node_name, data in grouped_pods.items():
-            print(f"\nNode: {node_name} (Type: {data['node_type']})")  # Display node type here
+            print(f"\nNode: {node_name} (Type: {data['node_type']})")
             
             # Allocatable resources
             print("  Allocatable Resources:")
@@ -327,18 +458,18 @@ def print_pods_with_resources(grouped_pods, ungrouped_pods):
 # Main execution
 # ------------------------------
 if __name__ == "__main__":
-    # Get node data and create info map (includes allocatable resources and node type)
+    # Get node data and create info map
     print("Retrieving node information...")
     node_data = get_all_nodes()
     
     if not node_data:
-        print("Failed to retrieve valid node data - cannot proceed with pod grouping")
+        print("Failed to retrieve valid node data - cannot proceed")
     else:
         print("Successfully retrieved node data")
         node_info_map = create_node_info_map(node_data)
         print(f"Created node info mapping for {len(node_info_map)} nodes")
 
-        # Get pod data and group by node with resources
+        # Get pod data and group by node
         print("\nRetrieving pod information...")
         pod_data = get_all_pods()
         
@@ -346,6 +477,10 @@ if __name__ == "__main__":
             print("Successfully retrieved pod data")
             grouped_pods, ungrouped_pods = group_pods_by_node(pod_data, node_info_map)
             print_pods_with_resources(grouped_pods, ungrouped_pods)
+            
+            # Add aggregated worker node section
+            aggregated_worker_groups = aggregate_worker_nodes_by_labels(node_data, grouped_pods, node_info_map)
+            print_aggregated_worker_nodes(aggregated_worker_groups)
         else:
             print("Failed to retrieve valid pod data")
     
