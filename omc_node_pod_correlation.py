@@ -1,6 +1,7 @@
 import subprocess
 import json
 from collections import defaultdict
+import argparse
 
 # ------------------------------
 # Helper functions for resource parsing
@@ -12,10 +13,8 @@ def parse_cpu(cpu_value):
     cpu_str = str(cpu_value).strip().lower()
     try:
         if cpu_str.endswith('m'):
-            # Convert millicores to cores
             return float(cpu_str[:-1]) / 1000.0
         else:
-            # Assume value is in cores
             return float(cpu_str)
     except (ValueError, TypeError):
         return 0.0
@@ -26,21 +25,12 @@ def parse_memory(mem_value):
         return 0
     mem_str = str(mem_value).strip().lower()
     memory_units = {
-        'k': 1000,
-        'm': 1000**2,
-        'g': 1000**3,
-        't': 1000**4,
-        'p': 1000**5,
-        'e': 1000**6,
-        'ki': 1024,
-        'mi': 1024**2,
-        'gi': 1024**3,
-        'ti': 1024**4,
-        'pi': 1024**5,
-        'ei': 1024**6,
+        'k': 1000, 'm': 1000**2, 'g': 1000**3, 't': 1000**4,
+        'p': 1000**5, 'e': 1000**6,
+        'ki': 1024, 'mi': 1024**2, 'gi': 1024**3, 'ti': 1024**4,
+        'pi': 1024**5, 'ei': 1024**6,
     }
 
-    # Extract unit and numeric part
     unit = ''
     if len(mem_str) >= 2 and mem_str[-2:] in memory_units:
         unit = mem_str[-2:]
@@ -57,18 +47,22 @@ def parse_memory(mem_value):
     except (ValueError, TypeError):
         return 0
 
+def parse_pods(pod_value):
+    """Parse pod count value"""
+    if not pod_value:
+        return 0
+    try:
+        return int(pod_value)
+    except (ValueError, TypeError):
+        return 0
+
 def format_memory(bytes_value):
     """Convert bytes to human-readable format"""
     if bytes_value == 0:
         return "0"
     units = [
-        ('Ei', 1024**6),
-        ('Pi', 1024**5),
-        ('Ti', 1024**4),
-        ('Gi', 1024**3),
-        ('Mi', 1024**2),
-        ('Ki', 1024),
-        ('B', 1)
+        ('Ei', 1024**6), ('Pi', 1024**5), ('Ti', 1024**4),
+        ('Gi', 1024**3), ('Mi', 1024**2), ('Ki', 1024), ('B', 1)
     ]
     for unit, factor in units:
         if bytes_value >= factor:
@@ -145,7 +139,7 @@ def get_all_pods():
 # ------------------------------
 def create_node_info_map(node_data):
     """Create a mapping from node IP to node info (name + allocatable resources + node type + labels)"""
-    node_info_map = {}  # {ip: {name, allocatable_cpu, allocatable_memory, node_type, labels}}
+    node_info_map = {}  # {ip: {name, allocatable_cpu, allocatable_memory, allocatable_pods, node_type, labels}}
     
     if not node_data or 'items' not in node_data or not isinstance(node_data['items'], list):
         return node_info_map
@@ -167,13 +161,15 @@ def create_node_info_map(node_data):
             allocatable = node.get('status', {}).get('allocatable', {})
             allocatable_cpu = parse_cpu(allocatable.get('cpu', '0'))
             allocatable_memory = parse_memory(allocatable.get('memory', '0'))
+            allocatable_pods = parse_pods(allocatable.get('pods', '0'))  # New: parse pod count
             
             node_info_map[node_ip] = {
                 'name': node_name,
                 'node_type': node_type,
                 'labels': labels,
                 'allocatable_cpu': allocatable_cpu,
-                'allocatable_memory': allocatable_memory
+                'allocatable_memory': allocatable_memory,
+                'allocatable_pods': allocatable_pods  # New: store pod allocations
             }
         except KeyError as e:
             print(f"Warning: Missing {e} field in node {node.get('metadata', {}).get('name', 'unknown')}, skipping")
@@ -186,7 +182,7 @@ def create_node_info_map(node_data):
 
 def group_pods_by_node(pod_data, node_info_map):
     """Group pods by node with resource calculations and allocatable info"""
-    # Structure: {node_name: {'allocatable': {...}, 'node_type': ..., 'totals': {...}, 'pods': [...]}}
+    # Structure: {node_name: {'allocatable': {...}, 'node_type': ..., 'totals': {...}, 'pod_count': int, 'pods': [...]}}
     grouped_pods = {}
     ungrouped_pods = []
     
@@ -240,7 +236,8 @@ def group_pods_by_node(pod_data, node_info_map):
                         'node_type': node_info['node_type'],
                         'allocatable': {
                             'cpu': node_info['allocatable_cpu'],
-                            'memory': node_info['allocatable_memory']
+                            'memory': node_info['allocatable_memory'],
+                            'pods': node_info['allocatable_pods']  # New: add pod allocations
                         },
                         'totals': {
                             'cpu_request': 0.0,
@@ -248,11 +245,13 @@ def group_pods_by_node(pod_data, node_info_map):
                             'mem_request': 0,
                             'mem_limit': 0
                         },
+                        'pod_count': 0,  # New: track pod count
                         'pods': []
                     }
                 
                 # Add pod to node and update totals
                 grouped_pods[node_name]['pods'].append(pod_info)
+                grouped_pods[node_name]['pod_count'] += 1  # New: increment pod count
                 grouped_pods[node_name]['totals']['cpu_request'] += pod_cpu_request
                 grouped_pods[node_name]['totals']['cpu_limit'] += pod_cpu_limit
                 grouped_pods[node_name]['totals']['mem_request'] += pod_mem_request
@@ -267,13 +266,13 @@ def group_pods_by_node(pod_data, node_info_map):
     
     return grouped_pods, ungrouped_pods
 
-def aggregate_worker_nodes_by_labels(node_data, grouped_pods, node_info_map):
-    """Aggregate worker nodes by common labels (excluding specified labels)"""
-    # Group worker nodes by their common labels (excluding specified labels)
-    label_groups = defaultdict(list)
+def aggregate_nodes_by_type_and_labels(node_data, grouped_pods, node_info_map):
+    """Aggregate all node types by their type first, then by common labels (excluding specified labels)"""
+    # Structure: {node_type: {label_key: group_data}}
+    type_groups = defaultdict(lambda: defaultdict(list))
     
     if not node_data or 'items' not in node_data or not isinstance(node_data['items'], list):
-        return label_groups
+        return type_groups
     
     for node in node_data['items']:
         try:
@@ -284,20 +283,18 @@ def aggregate_worker_nodes_by_labels(node_data, grouped_pods, node_info_map):
                 continue
                 
             node_info = node_info_map[node_ip]
-            # Only process worker nodes
-            if node_info['node_type'] != 'worker':
-                continue
+            node_type = node_info['node_type']
                 
             # Get labels and remove excluded labels
             labels = node.get('metadata', {}).get('labels', {}).copy()
             # Exclude specified labels
-            labels.pop('kubernetes.io/hostname', None)  # Unique hostname label
-            labels.pop('node.name', None)               # Additional excluded label
-            labels.pop('twistlock-defender', None)      # Additional excluded label
+            labels.pop('kubernetes.io/hostname', None)
+            labels.pop('node.name', None)
+            labels.pop('twistlock-defender', None)
             
             # Create a hashable key from labels (sorted tuples)
             label_key = tuple(sorted(labels.items()))
-            label_groups[label_key].append(node_name)
+            type_groups[node_type][label_key].append(node_name)
             
         except (KeyError, IndexError) as e:
             print(f"Warning: Skipping node {node.get('metadata', {}).get('name', 'unknown')} during aggregation: {e}")
@@ -305,101 +302,120 @@ def aggregate_worker_nodes_by_labels(node_data, grouped_pods, node_info_map):
             print(f"Error aggregating node {node.get('metadata', {}).get('name', 'unknown')}: {e}")
     
     # Calculate aggregated resources for each group
-    aggregated_groups = {}
-    for label_key, node_names in label_groups.items():
-        # Convert label key back to dictionary
-        common_labels = dict(label_key)
-        
-        # Initialize aggregates
-        total_nodes = len(node_names)
-        total_allocatable_cpu = 0.0
-        total_allocatable_memory = 0
-        total_cpu_request = 0.0
-        total_cpu_limit = 0.0
-        total_mem_request = 0
-        total_mem_limit = 0
-        
-        # Sum resources across all nodes in the group
-        for node_name in node_names:
-            if node_name in grouped_pods:
-                node_data = grouped_pods[node_name]
-                # Allocatable resources
-                total_allocatable_cpu += node_data['allocatable']['cpu']
-                total_allocatable_memory += node_data['allocatable']['memory']
-                # Pod resources
-                total_cpu_request += node_data['totals']['cpu_request']
-                total_cpu_limit += node_data['totals']['cpu_limit']
-                total_mem_request += node_data['totals']['mem_request']
-                total_mem_limit += node_data['totals']['mem_limit']
-        
-        aggregated_groups[label_key] = {
-            'common_labels': common_labels,
-            'node_count': total_nodes,
-            'nodes': node_names,
-            'allocatable': {
-                'cpu': total_allocatable_cpu,
-                'memory': total_allocatable_memory
-            },
-            'totals': {
-                'cpu_request': total_cpu_request,
-                'cpu_limit': total_cpu_limit,
-                'mem_request': total_mem_request,
-                'mem_limit': total_mem_limit
+    aggregated_results = defaultdict(dict)
+    for node_type, label_groups in type_groups.items():
+        for label_key, node_names in label_groups.items():
+            # Convert label key back to dictionary
+            common_labels = dict(label_key)
+            
+            # Initialize aggregates
+            total_nodes = len(node_names)
+            total_allocatable_cpu = 0.0
+            total_allocatable_memory = 0
+            total_allocatable_pods = 0  # New: track total pod capacity
+            total_cpu_request = 0.0
+            total_cpu_limit = 0.0
+            total_mem_request = 0
+            total_mem_limit = 0
+            total_pod_count = 0  # New: track total pods in group
+            
+            # Sum resources across all nodes in the group
+            for node_name in node_names:
+                if node_name in grouped_pods:
+                    node_data = grouped_pods[node_name]
+                    # Allocatable resources
+                    total_allocatable_cpu += node_data['allocatable']['cpu']
+                    total_allocatable_memory += node_data['allocatable']['memory']
+                    total_allocatable_pods += node_data['allocatable']['pods']  # New
+                    # Pod resources
+                    total_cpu_request += node_data['totals']['cpu_request']
+                    total_cpu_limit += node_data['totals']['cpu_limit']
+                    total_mem_request += node_data['totals']['mem_request']
+                    total_mem_limit += node_data['totals']['mem_limit']
+                    total_pod_count += node_data['pod_count']  # New
+            
+            aggregated_results[node_type][label_key] = {
+                'common_labels': common_labels,
+                'node_count': total_nodes,
+                'nodes': node_names,
+                'allocatable': {
+                    'cpu': total_allocatable_cpu,
+                    'memory': total_allocatable_memory,
+                    'pods': total_allocatable_pods  # New
+                },
+                'totals': {
+                    'cpu_request': total_cpu_request,
+                    'cpu_limit': total_cpu_limit,
+                    'mem_request': total_mem_request,
+                    'mem_limit': total_mem_limit,
+                    'pod_count': total_pod_count  # New
+                }
             }
-        }
     
-    return aggregated_groups
+    return aggregated_results
 
-def print_aggregated_worker_nodes(aggregated_groups):
-    """Print aggregated worker node information grouped by common labels"""
-    print("\n=== Aggregated Worker Nodes by Common Labels ===")
+def print_aggregated_nodes(aggregated_results):
+    """Print aggregated node information grouped by node type and common labels"""
+    print("\n=== Aggregated Nodes by Type and Common Labels ===")
     
-    if not aggregated_groups:
-        print("No worker nodes found for aggregation")
+    if not aggregated_results:
+        print("No nodes found for aggregation")
         return
     
-    for i, (_, group_data) in enumerate(aggregated_groups.items(), 1):
-        print(f"\nGroup {i}:")
-        print(f"  Number of worker nodes: {group_data['node_count']}")
-        print("  Common labels:")
-        for label, value in group_data['common_labels'].items():
-            print(f"    {label}: {value}")
-        print("  Nodes in group:")
-        for node_name in group_data['nodes']:
-            print(f"    - {node_name}")
+    for node_type, label_groups in aggregated_results.items():
+        print(f"\nNode Type: {node_type}")
+        print("-" * (len(node_type) + 11))  # Underline the type header
         
-        print("  Aggregated Allocatable Resources:")
-        print(f"    Total CPU: {group_data['allocatable']['cpu']:.3f} cores")
-        print(f"    Total Memory: {format_memory(group_data['allocatable']['memory'])}")
-        
-        print("  Aggregated Pod Resources:")
-        # CPU calculations
-        cpu_request_pct = calculate_percentage(
-            group_data['totals']['cpu_request'],
-            group_data['allocatable']['cpu']
-        )
-        cpu_limit_pct = calculate_percentage(
-            group_data['totals']['cpu_limit'],
-            group_data['allocatable']['cpu']
-        )
-        print(f"    Total CPU Requests: {group_data['totals']['cpu_request']:.3f} cores ({cpu_request_pct} of total allocatable)")
-        print(f"    Total CPU Limits: {group_data['totals']['cpu_limit']:.3f} cores ({cpu_limit_pct} of total allocatable)")
-        
-        # Memory calculations
-        mem_request_pct = calculate_percentage(
-            group_data['totals']['mem_request'],
-            group_data['allocatable']['memory']
-        )
-        mem_limit_pct = calculate_percentage(
-            group_data['totals']['mem_limit'],
-            group_data['allocatable']['memory']
-        )
-        print(f"    Total Memory Requests: {format_memory(group_data['totals']['mem_request'])} ({mem_request_pct} of total allocatable)")
-        print(f"    Total Memory Limits: {format_memory(group_data['totals']['mem_limit'])} ({mem_limit_pct} of total allocatable)")
+        for i, (_, group_data) in enumerate(label_groups.items(), 1):
+            print(f"\n  Group {i}:")
+            print(f"    Number of nodes: {group_data['node_count']}")
+            print("    Common labels:")
+            for label, value in group_data['common_labels'].items():
+                print(f"      {label}: {value}")
+            print("    Nodes in group:")
+            for node_name in group_data['nodes']:
+                print(f"      - {node_name}")
+            
+            print("    Aggregated Allocatable Resources:")
+            print(f"      Total CPU: {group_data['allocatable']['cpu']:.3f} cores")
+            print(f"      Total Memory: {format_memory(group_data['allocatable']['memory'])}")
+            print(f"      Total Pod Capacity: {group_data['allocatable']['pods']} pods")  # New
+            
+            print("    Aggregated Usage:")
+            # CPU calculations
+            cpu_request_pct = calculate_percentage(
+                group_data['totals']['cpu_request'],
+                group_data['allocatable']['cpu']
+            )
+            cpu_limit_pct = calculate_percentage(
+                group_data['totals']['cpu_limit'],
+                group_data['allocatable']['cpu']
+            )
+            print(f"      CPU Requests: {group_data['totals']['cpu_request']:.3f} cores ({cpu_request_pct} of allocatable)")
+            print(f"      CPU Limits: {group_data['totals']['cpu_limit']:.3f} cores ({cpu_limit_pct} of allocatable)")
+            
+            # Memory calculations
+            mem_request_pct = calculate_percentage(
+                group_data['totals']['mem_request'],
+                group_data['allocatable']['memory']
+            )
+            mem_limit_pct = calculate_percentage(
+                group_data['totals']['mem_limit'],
+                group_data['allocatable']['memory']
+            )
+            print(f"      Memory Requests: {format_memory(group_data['totals']['mem_request'])} ({mem_request_pct} of allocatable)")
+            print(f"      Memory Limits: {format_memory(group_data['totals']['mem_limit'])} ({mem_limit_pct} of allocatable)")
+            
+            # New: Pod count calculations
+            pod_pct = calculate_percentage(
+                group_data['totals']['pod_count'],
+                group_data['allocatable']['pods']
+            )
+            print(f"      Pod Count: {group_data['totals']['pod_count']} pods ({pod_pct} of capacity)")
 
-def print_pods_with_resources(grouped_pods, ungrouped_pods):
-    """Print pods grouped by node with resource summary, allocatable resources, percentages, and node type"""
-    print("\n=== Pods Grouped by Node with Resource Utilization ===")
+def print_pods_with_resources(grouped_pods, ungrouped_pods, show_pods=False):
+    """Print pods grouped by node with resource summary, including pod count utilization"""
+    print("\n=== Node Resource Utilization Summary ===")
     
     # Print grouped pods
     if grouped_pods:
@@ -410,9 +426,10 @@ def print_pods_with_resources(grouped_pods, ungrouped_pods):
             print("  Allocatable Resources:")
             print(f"    CPU: {data['allocatable']['cpu']:.3f} cores")
             print(f"    Memory: {format_memory(data['allocatable']['memory'])}")
+            print(f"    Max Pods: {data['allocatable']['pods']}")  # New
             
             # Total requests/limits with percentages
-            print("  Total Pod Resources:")
+            print("  Total Usage:")
             # CPU calculations
             cpu_request_pct = calculate_percentage(
                 data['totals']['cpu_request'], 
@@ -437,27 +454,37 @@ def print_pods_with_resources(grouped_pods, ungrouped_pods):
             print(f"    Memory Requests: {format_memory(data['totals']['mem_request'])} ({mem_request_pct} of allocatable)")
             print(f"    Memory Limits: {format_memory(data['totals']['mem_limit'])} ({mem_limit_pct} of allocatable)")
             
-            # Individual pods
-            print("  Pods:")
-            for pod in data['pods']:
-                print(f"    - {pod['namespace']}/{pod['name']}")
-                print(f"        CPU Request: {pod['cpu_request']:.3f} cores | Limit: {pod['cpu_limit']:.3f} cores")
-                print(f"        Memory Request: {format_memory(pod['mem_request'])} | Limit: {format_memory(pod['mem_limit'])}")
+            # New: Pod count calculation
+            pod_pct = calculate_percentage(
+                data['pod_count'], 
+                data['allocatable']['pods']
+            )
+            print(f"    Pods: {data['pod_count']} running ({pod_pct} of capacity)")
+            
+            # Print pod list only if enabled
+            if show_pods and data['pods']:
+                print("  Pod List:")
+                for pod in data['pods']:
+                    print(f"    - {pod['namespace']}/{pod['name']}")
     else:
         print("\nNo pods were successfully grouped by node")
     
-    # Print ungrouped pods if any
-    if ungrouped_pods:
+    # Print ungrouped pods if enabled
+    if show_pods and ungrouped_pods:
         print("\n=== Ungrouped Pods (could not match to a node) ===")
         for pod in ungrouped_pods:
             print(f"  - {pod['namespace']}/{pod['name']}")
-            print(f"      CPU Request: {pod['cpu_request']:.3f} cores | Limit: {pod['cpu_limit']:.3f} cores")
-            print(f"      Memory Request: {format_memory(pod['mem_request'])} | Limit: {format_memory(pod['mem_limit'])}")
 
 # ------------------------------
 # Main execution
 # ------------------------------
 if __name__ == "__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Kubernetes Node and Pod Resource Analyzer')
+    parser.add_argument('--show-pods', action='store_true', 
+                      help='Show individual pod lists (disabled by default)')
+    args = parser.parse_args()
+
     # Get node data and create info map
     print("Retrieving node information...")
     node_data = get_all_nodes()
@@ -476,11 +503,11 @@ if __name__ == "__main__":
         if pod_data:
             print("Successfully retrieved pod data")
             grouped_pods, ungrouped_pods = group_pods_by_node(pod_data, node_info_map)
-            print_pods_with_resources(grouped_pods, ungrouped_pods)
+            print_pods_with_resources(grouped_pods, ungrouped_pods, args.show_pods)
             
-            # Add aggregated worker node section
-            aggregated_worker_groups = aggregate_worker_nodes_by_labels(node_data, grouped_pods, node_info_map)
-            print_aggregated_worker_nodes(aggregated_worker_groups)
+            # Add aggregated nodes section (all types)
+            aggregated_results = aggregate_nodes_by_type_and_labels(node_data, grouped_pods, node_info_map)
+            print_aggregated_nodes(aggregated_results)
         else:
             print("Failed to retrieve valid pod data")
     
